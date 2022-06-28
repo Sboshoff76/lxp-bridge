@@ -3,12 +3,12 @@ use crate::prelude::*;
 use cron_parser::parse;
 
 pub struct Scheduler {
-    config: Rc<Config>,
+    config: Config,
     channels: Channels,
 }
 
 impl Scheduler {
-    pub fn new(config: Rc<Config>, channels: Channels) -> Self {
+    pub fn new(config: Config, channels: Channels) -> Self {
         Self { config, channels }
     }
 

@@ -2,6 +2,7 @@ use crate::prelude::*;
 
 use {
     async_trait::async_trait,
+    net2::TcpStreamExt, // for set_keepalive
     serde::{Serialize, Serializer},
     tokio::io::{AsyncReadExt, AsyncWriteExt},
 };
@@ -116,39 +117,44 @@ impl std::fmt::Debug for Serial {
     }
 } // }}}
 
-// these are kept separately because we learn what the correct ones are from the inverter
-struct Serials {
-    pub datalog: Serial,
-    pub inverter: Serial,
-}
-
 pub struct Inverter {
-    config: config::Inverter,
+    idx: usize,
+    config: RefCell<Config>,
     channels: Channels,
-    serials: RefCell<Serials>,
 }
 
 impl Inverter {
-    pub fn new(config: config::Inverter, channels: Channels) -> Self {
-        let serials = RefCell::new(Serials {
-            datalog: config.datalog,
-            inverter: config.serial,
-        });
-
+    pub fn new(idx: usize, config: Config, channels: Channels) -> Self {
+        let config = RefCell::new(config);
         Self {
+            idx,
             config,
             channels,
-            serials,
         }
     }
 
+    fn enabled(&self) -> bool {
+        let i = &self.config.borrow().inverters[self.idx];
+
+        if !i.enabled {
+            info!("inverter {} is disabled, not connecting", i.datalog);
+        }
+
+        i.enabled
+    }
+
     pub async fn start(&self) -> Result<()> {
+        if !self.enabled() {
+            return Ok(());
+        }
+
         while let Err(e) = self.connect().await {
-            error!("inverter {}: {}", self.config.datalog, e);
-            info!("inverter {}: reconnecting in 5s", self.config.datalog);
+            let datalog = self.config.borrow().inverters[self.idx].datalog;
+            error!("inverter {}: {}", datalog, e);
+            info!("inverter {}: reconnecting in 5s", datalog);
             self.channels
                 .from_inverter
-                .send(ChannelData::Disconnect(self.config.datalog))?; // kill any waiting readers
+                .send(ChannelData::Disconnect(datalog))?; // kill any waiting readers
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         }
 
@@ -160,23 +166,48 @@ impl Inverter {
     }
 
     async fn connect(&self) -> Result<()> {
-        use net2::TcpStreamExt; // for set_keepalive
+        let inverter_hp = {
+            let config = &self.config.borrow().inverters[self.idx];
 
-        info!(
-            "connecting to inverter {} at {}:{}",
-            &self.config.datalog, &self.config.host, self.config.port
-        );
+            info!(
+                "connecting to inverter {} at {}:{}",
+                &config.datalog, &config.host, config.port
+            );
 
-        let inverter_hp = (self.config.host.to_string(), self.config.port);
+            (config.host.to_string(), config.port)
+        };
 
         let stream = tokio::net::TcpStream::connect(inverter_hp).await?;
         let std_stream = stream.into_std()?;
         std_stream.set_keepalive(Some(std::time::Duration::new(60, 0)))?;
         let (reader, writer) = tokio::net::TcpStream::from_std(std_stream)?.into_split();
 
-        info!("inverter {}: connected!", self.config.datalog);
+        info!(
+            "inverter {}: connected!",
+            self.config.borrow().inverters[self.idx].datalog
+        );
 
-        futures::try_join!(self.sender(writer), self.receiver(reader))?;
+        futures::try_join!(
+            self.config_updater(),
+            self.sender(writer),
+            self.receiver(reader)
+        )?;
+
+        Ok(())
+    }
+
+    async fn config_updater(&self) -> Result<()> {
+        let mut receiver = self.channels.config_updates.subscribe();
+
+        use config::ChannelData::*;
+
+        loop {
+            match receiver.recv().await? {
+                ConfigUpdated(new) => *self.config.borrow_mut() = new,
+                Shutdown => break,
+                _ => continue,
+            }
+        }
 
         Ok(())
     }
@@ -218,7 +249,7 @@ impl Inverter {
                 self.compare_datalog(packet.datalog()); // all packets have datalog serial
                 if let Packet::TranslatedData(td) = packet {
                     // only TranslatedData has inverter serial
-                    self.compare_inverter(td.inverter);
+                    self.compare_serial(td.inverter);
                 };
             }
         }
@@ -238,73 +269,94 @@ impl Inverter {
                 // this doesn't actually happen yet; Disconnect is never sent to this channel
                 Disconnect(_) => bail!("sender exiting due to ChannelData::Disconnect"),
                 Packet(packet) => {
-                    // this works, but needs more thought. because we only fix it here, immediately
-                    // before transmission, calls to wait_for_reply with the original serials will
-                    // never complete. ideally we need to pass the fixed packet back?
-                    //self.fix_outgoing_packet_serials(&mut packet);
+                    let bytes = {
+                        let config = &self.config.borrow().inverters[self.idx];
+                        if packet.datalog() != config.datalog {
+                            continue;
+                        }
 
-                    if packet.datalog() == self.serials.borrow().datalog {
-                        //debug!("inverter {}: TX {:?}", self.config.datalog, packet);
+                        //debug!("inverter {}: TX {:?}", config.datalog, packet);
                         let bytes = lxp::packet::TcpFrameFactory::build(&packet);
-                        debug!("inverter {}: TX {:?}", self.config.datalog, bytes);
-                        socket.write_all(&bytes).await?
-                    }
+                        debug!("inverter {}: TX {:?}", config.datalog, bytes);
+                        bytes
+                    };
+                    socket.write_all(&bytes).await?
                 }
             }
         }
 
-        info!("inverter {}: sender exiting", self.config.datalog);
+        let config = &self.config.borrow().inverters[self.idx];
+        info!("inverter {}: sender exiting", config.datalog);
 
         Ok(())
     }
 
-    /* TODO. need to solve wait_for_reply hanging when we fix the serials.. */
-    #[allow(dead_code)]
-    fn fix_outgoing_packet_serials(&self, packet: &mut Packet) {
-        let ob = self.serials.borrow();
-        if packet.datalog() != ob.datalog {
-            warn!(
-                "fixing datalog in outgoing packet from {} to {}",
-                packet.datalog(),
-                ob.datalog
-            );
-            packet.set_datalog(ob.datalog);
-        }
-
-        if let Some(inverter) = packet.inverter() {
-            if inverter != ob.inverter {
-                warn!(
-                    "fixing serial in outgoing packet from {} to {}",
-                    inverter, ob.inverter
-                );
-                packet.set_inverter(ob.inverter);
-            }
-        }
-    }
-
     fn compare_datalog(&self, packet: Serial) {
-        let b_datalog = self.serials.borrow().datalog;
-
-        if packet != b_datalog {
-            warn!(
-                "datalog serial mismatch found; packet={}, config={} - please check config!",
-                packet, b_datalog
-            );
-            // uncomment this when I fix serials in outgoing packets?
-            //self.serials.borrow_mut().datalog = packet;
+        let config = &self.config.borrow().inverters[self.idx];
+        if packet == config.datalog {
+            return;
         }
+
+        warn!(
+            "datalog serial mismatch found; packet={}, config={} - please check config!",
+            packet, config.datalog
+        );
+
+        //construct a new config::Inverter object with the correct datalog
+        let config = config.clone(); // copy of the old config
+        let mut new = config.clone();
+        new.datalog = packet;
+
+        self.channels
+            .config_updates
+            .send(config::ChannelData::UpdateInverter(config, new))
+            .unwrap();
     }
 
+    fn compare_serial(&self, packet: Serial) {
+        let config = &self.config.borrow().inverters[self.idx];
+        if packet == config.serial {
+            return;
+        }
+
+        warn!(
+            "inverter serial mismatch found; packet={}, config={} - please check config!",
+            packet, config.serial
+        );
+
+        //construct a new config::Inverter object with the correct datalog
+        let config = config.clone(); // copy of the old config
+        let mut new = config.clone();
+        new.serial = packet;
+
+        self.channels
+            .config_updates
+            .send(config::ChannelData::UpdateInverter(config, new))
+            .unwrap();
+    }
+
+    /*
     fn compare_inverter(&self, packet: Serial) {
-        let b_inverter = self.serials.borrow().inverter;
+        let b_inverter = self.config().serial;
 
         if packet != b_inverter {
             warn!(
                 "inverter serial mismatch found; packet={}, config={} - please check config!",
                 packet, b_inverter
             );
-            // uncomment this when I fix serials in outgoing packets?
-            self.serials.borrow_mut().inverter = packet;
+
+            //construct a new config::Inverter object with the correct serial
+            let mut new = self.config().clone();
+            new.serial = packet;
+
+            self.channels
+                .config_updates
+                .send(config::ChannelData::UpdateInverter(
+                    self.config().clone(),
+                    new,
+                ))
+                .unwrap();
         }
     }
+    */
 }

@@ -14,12 +14,12 @@ pub enum ChannelData {
 pub type Sender = broadcast::Sender<ChannelData>;
 
 pub struct Influx {
-    config: Rc<Config>,
+    config: Config,
     channels: Channels,
 }
 
 impl Influx {
-    pub fn new(config: Rc<Config>, channels: Channels) -> Self {
+    pub fn new(config: Config, channels: Channels) -> Self {
         Self { config, channels }
     }
 

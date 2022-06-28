@@ -166,13 +166,13 @@ pub enum ChannelData {
 pub type Sender = broadcast::Sender<ChannelData>;
 
 pub struct Mqtt {
-    config: Rc<Config>,
+    config: Config,
     shutdown: bool,
     channels: Channels,
 }
 
 impl Mqtt {
-    pub fn new(config: Rc<Config>, channels: Channels) -> Self {
+    pub fn new(config: Config, channels: Channels) -> Self {
         Self {
             config,
             channels,

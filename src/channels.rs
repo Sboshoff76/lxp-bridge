@@ -8,6 +8,7 @@ pub struct Channels {
     pub to_mqtt: broadcast::Sender<mqtt::ChannelData>,
     pub to_influx: broadcast::Sender<influx::ChannelData>,
     pub to_database: broadcast::Sender<database::ChannelData>,
+    pub config_updates: broadcast::Sender<config::ChannelData>,
 }
 
 impl Default for Channels {
@@ -25,6 +26,7 @@ impl Channels {
             to_mqtt: Self::channel(),
             to_influx: Self::channel(),
             to_database: Self::channel(),
+            config_updates: Self::channel(),
         }
     }
 

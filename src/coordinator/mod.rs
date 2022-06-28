@@ -13,13 +13,13 @@ pub enum ChannelData {
 pub type InputsStore = std::collections::HashMap<Serial, lxp::packet::ReadInputs>;
 
 pub struct Coordinator {
-    config: Rc<Config>,
+    config: Config,
     have_enabled_databases: bool,
     channels: Channels,
 }
 
 impl Coordinator {
-    pub fn new(config: Rc<Config>, channels: Channels) -> Self {
+    pub fn new(config: Config, channels: Channels) -> Self {
         let have_enabled_databases = config.enabled_databases().count() > 0;
 
         Self {

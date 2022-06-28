@@ -46,19 +46,21 @@ async fn app() -> Result<()> {
 
     info!("lxp-bridge {} starting", CARGO_PKG_VERSION);
 
-    let config = Rc::new(Config::new(options.config_file)?);
-
     let channels = Channels::new();
 
-    let scheduler = Scheduler::new(Rc::clone(&config), channels.clone());
-    let mqtt = Mqtt::new(Rc::clone(&config), channels.clone());
-    let influx = Influx::new(Rc::clone(&config), channels.clone());
-    let coordinator = Coordinator::new(Rc::clone(&config), channels.clone());
+    let mut config = Config::new(&options.config_file)?;
+
+    let scheduler = Scheduler::new(config.clone(), channels.clone());
+    let mqtt = Mqtt::new(config.clone(), channels.clone());
+    let influx = Influx::new(config.clone(), channels.clone());
+    let coordinator = Coordinator::new(config.clone(), channels.clone());
 
     let inverters = config
-        .enabled_inverters()
+        .inverters
+        .iter()
         .cloned()
-        .map(|inverter| Inverter::new(inverter, channels.clone()))
+        .enumerate()
+        .map(|(i, inverter)| Inverter::new(i, config.clone(), channels.clone()))
         .collect();
 
     let databases = config
@@ -70,6 +72,7 @@ async fn app() -> Result<()> {
     futures::try_join!(
         start_databases(databases),
         start_inverters(inverters),
+        config.start(channels.clone()),
         scheduler.start(),
         mqtt.start(),
         influx.start(),
@@ -87,8 +90,8 @@ async fn start_databases(databases: Vec<Database>) -> Result<()> {
     Ok(())
 }
 
-async fn start_inverters(inverters: Vec<Inverter>) -> Result<()> {
-    let futures = inverters.iter().map(|i| i.start());
+async fn start_inverters(mut inverters: Vec<Inverter>) -> Result<()> {
+    let futures = inverters.iter_mut().map(|i| i.start());
 
     futures::future::join_all(futures).await;
 
